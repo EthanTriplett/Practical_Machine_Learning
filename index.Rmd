@@ -1,0 +1,244 @@
+---
+title: "Coursera Machine Learning Course Project"
+author: "Ethan Triplett"
+date: "March 15, 2016"
+output: html_document
+---
+
+##Overview and Purpose
+
+In a clinical study, 6 participants were asked to perform an exercise correctly, and also in each of 4 incorrect ways.  These participants used personal health devices (e.g. Jawbone Up, Nike Fuelband, and Fitbit) attached to both themselves and their exercise equipment.  The devices captured information as they completed the study.
+
+The exercise quality is identified via letter grade: A (correct way) and B through E (incorrect ways).  The purpose of this assignment is to build an algorithm that can identify how the individual is performing the exercise, i.e. to identify which of the 5 grades took place, given data from the devices.  Such an algorithm could then be used to help novice weightlifters refine their technique without requiring a human coach.
+
+The project and data were generously provided, the citation of which follows:
+
+*Ugulino, W.; Cardador, D.; Vega, K.; Velloso, E.; Milidiu, R.; Fuks, H. Wearable Computing: Accelerometers' Data Classification of Body Postures and Movements. Proceedings of 21st Brazilian Symposium on Artificial Intelligence. Advances in Artificial Intelligence - SBIA 2012. In: Lecture Notes in Computer Science. , pp. 52-61. Curitiba, PR: Springer Berlin / Heidelberg, 2012. ISBN 978-3-642-34458-9. DOI: 10.1007/978-3-642-34459-6_6.*
+
+For more information see [this link.](http://groupware.les.inf.puc-rio.br/har)
+
+##Load Packages and Import Data
+
+The __train__ set is available [here.](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv)
+
+The __test__ set is available [here.](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv)
+
+```{r, echo=FALSE, cache=FALSE}
+setwd("C:/Users/et87523/Desktop/Coursera/8_Machine_Learning")
+```
+
+
+```{r, echo=TRUE, cache=FALSE}
+suppressWarnings(suppressMessages(require(stringr)))
+suppressWarnings(suppressMessages(require(car)))
+suppressWarnings(suppressMessages(require(caret)))
+suppressWarnings(suppressMessages(require(dplyr)))
+suppressWarnings(suppressMessages(require(ggplot2)))
+suppressWarnings(suppressMessages(require(rpart)))
+
+data <- read.csv("pml-training.csv")
+dim(data)
+```
+
+##Data clean-up
+
+Viewing the data shows many columns that are only meaningfully populated when the field "new window" is "Y".  This only occurs about 2% of the time.  As such I elected to delete these columns.  Note that the same clean-up steps will need to be performed on the test dataset.
+
+```{r}
+na_count <- as.data.frame(sapply(data, function(y) sum(length(which(is.na(y))))))
+blank_count <- as.data.frame(sapply(data, function(y) sum(length(which(y=="")))))
+
+na_and_blank_df <- cbind(na_count, blank_count)
+na_and_blank_df$to_delete <- na_and_blank_df[,1] + na_and_blank_df[,2]
+
+to_delete <- na_and_blank_df[which(na_and_blank_df$to_delete == 19216),]
+delete_cols <- rownames(to_delete)
+
+data_keep <- data[,-which(names(data) %in% delete_cols)]
+dim(data_keep)
+```
+
+Of the 160 columns that were in the original dataset, only 60 remain.  In other words, 100 columns were meaningless for ~98% of the training set.
+
+##Exploratory Data Analysis
+
+It is customary to begin every analysis with some simple one-way and two-way cuts, looking for patterns.  This document only reflects the most interesting reviews to conserve space.
+
+```{r, echo=TRUE}
+table(data_keep$classe)
+```
+
+Here we see the 5 exercise types (column 'classe').  The distribution of poor exercise technique (i.e. not A) records is fairly even, and there are enough observations that models should have no trouble identifying each type.
+
+```{r, echo=TRUE}
+num_window_table <- table(data_keep$num_window, data_keep$classe)
+head(num_window_table, n = 5)
+tail(num_window_table, n = 5)
+```
+
+Here I detected a quirk in the data.  It seems that "num window" maps perfectly to classe.  Scanning the 800+ records showed this to be true.  The following code proves it:
+
+```{r, echo=TRUE}
+num_window_df <- as.data.frame.matrix(num_window_table)
+num_window_df$max <- apply(num_window_df[,1:5],1,max)
+num_window_df$sum <- apply(num_window_df[,1:5],1,sum)
+num_window_df$diff <- num_window_df$max-num_window_df$sum
+table(num_window_df$diff)
+```
+
+In other words, there are no observations of "num window" that correspond to more than one value of 'classe'.  Reviewing the test dataset shows values of "num window" that are all represented in the train dataset.  As such it seems that simply looking up the classe from "num window" would generate perfect prediction accuracy.
+
+The instructions explicitly state that all available data can be used in the analysis.  If the only goal were prediction accuracy, I would stop here.  However, the goal is to learn modeling so I will ignore this finding and proceed.  Obviously in real-world examples such a shortcut will not be available.  Just out of curiosity, I will carry the implied prediction for comparison at the end:
+
+```{r, echo=TRUE}
+num_window_df <- as.data.frame.matrix(num_window_table)
+num_window_df$which_max <- apply(num_window_df, 1, which.max)
+num_window_df$outcome <- with(num_window_df,ifelse(which_max==1, "A",
+                                            ifelse(which_max==2, "B",
+                                            ifelse(which_max==3, "C",
+                                            ifelse(which_max==4, "D",
+                                            ifelse(which_max==5, "E", "Error"))))))
+num_window_df$row_names <- as.numeric(rownames(num_window_df))
+num_window_pred <- num_window_df[,c(8,7)]
+head(num_window_pred, n = 3)
+```
+
+
+## Modeling Considerations
+
+This problem is a classification analysis with multiple levels (in contrast to binary classification for which the goal is to pick one of only two levels).  Several model structures can be used for this case, one of which is __decision trees.__
+
+Decision trees involve successive splits on the predictor variables.  The algorithms in R operate by generating the greatest homogeneity in the resulting leaves.  It's worth noting that the decision tree will likely NOT pick up on the fact that 'num windows' perfectly predicts classe (at least not in the early splits), because the presence of 800+ levels of the variable will not reduce the _total_ heterogeneity very much.  
+
+## Modeling dataset
+
+Despite the eligibility of all data for modeling, I will restrict the modeling dataset to only the biometric readings from the devices.  Said another way, it may be that the particular person lifting weights is predictive for 'classe' but I would rather have the model generalize to all users.  The first 7 columns are removed from the list of eligible predictors:  
+
+```{r, echo=TRUE}
+data_predict <- data_keep[,-c(1:7)]
+```
+
+## Cross-Validation: Create Folds
+
+The caret package is capable of performing cross-validation.  However, I prefer to construct the validation manually to ensure I understand the process.
+
+```{r, echo=TRUE}
+set.seed(334)
+folds <- createFolds(y=data_predict$classe, k=10, list = TRUE, returnTrain = TRUE)
+sapply(folds, length)
+```
+
+This demonstrates that each fold is approximately the same size, namely 90% of the available (19.6k) records.  
+
+## Decision Tree Complexity Paramater
+
+When building decision trees, it is possible to include enough splits that every observation is perfectly identified (assuming no one set of inputs corresponds to outcomes of different classes).  This may not be prudent, however, because enormous trees usually begin to pick up on statistical noise if allowed to have enough split-points.
+
+The cross-validation will ensure that this does not happen.  I will cycle through a range of complexity parameter (denoted 'cp') values and use cross-validation to check for over-fitting.  The dangerous case is when the train accuracy is very good yet the test accuracy is poor.  The test set in this context is the single fold (~10% of the data) that is NOT included in the model.  
+
+Once a suitable complexity parameter is determined, I will run a tree on the full training dataset with that complexity parameter.  The resulting tree will then be the model used for the test dataset predictions.
+
+## Preparing the loop
+
+The following steps ready the loop for use.
+
+```{r, echo=TRUE}
+cp_table <- cbind(rep(1:15), c(0.00001, 0.00003, 0.00005, 0.00008, 0.0001, 0.0003, 0.0005,
+                              0.0008, 0.001, 0.003, 0.005, 0.008, 0.01, 0.02, 0.03))
+colnames(cp_table) <- c("j", "cp_use")
+cp_table
+```
+
+The cp_table contains values of the complexity parameter ranging from 0.00001 to 0.03.
+
+```{r, echo=TRUE}
+accuracy <- data.frame(fold = as.integer(), cp = as.numeric(), train_acc = as.numeric(), test_acc = as.numeric())
+```
+
+This has prepared a table called "accuracy" to collect the various train and test prediction accuracies as the loop is running.
+
+## Executing the loop
+
+```{r, echo=TRUE, cache=TRUE}
+
+for(j in 1:nrow(cp_table)){
+  for(i in 1:10){
+    train <- data_predict[folds[[i]],]
+    test <- data_predict[-folds[[i]],]
+    accuracy[(j-1)*10+i,1] <- i
+    cp_use <- cp_table[j,2]
+    tree <- rpart(classe ~ ., data = train, method = "class", cp = cp_use)
+    accuracy[(j-1)*10+i,2] <- cp_use 
+    train$pred <- predict(tree, train, type = "class")
+    conf_matrix_train <- table(train$classe, train$pred)
+    accuracy[(j-1)*10+i,3] <- sum(diag(conf_matrix_train))/nrow(train)
+    test$pred <- predict(tree, newdata = test, type = "class")
+    conf_matrix_test <- table(test$classe, test$pred)
+    accuracy[(j-1)*10+i,4] <- sum(diag(conf_matrix_test))/nrow(test)
+  }
+}
+```
+
+Line-by-line documentation:
+
+1. Cycle through each of the 15 cp parameters.
+2. For each of those, cycle through all 10 folds of the cross-validation.
+3. Set the training set to the current fold.
+4. Set the test set to all records not in the training fold.
+5. Populate the "accuracy" dataframe with the fold in progress.
+6. Use the complexity parameter corresponding to the current value of j.
+7. Fit a tree to the current fold of data with the current complexity parameter.
+8. Populate the "accuracy" dataframe with the current complexity parameter being used.
+9. Generate a prediction for each record in the training fold and attach it to the table.
+10. Create a confusion matrix for the training dataset.
+11. Populate the "accuracy" dataframe with (correct predictions) / (total predictions) for the train set.  Note that the "diag" function returns the records in the confusion matrix that are correct (i.e. Actual = "A" & Predicted = "A", Actual = "B" & Predicted = "B", ..., etc.)
+
+12-14: Repeat steps 9-11, but for test instead of train.
+
+## Interpreting the Results and Selecting a Model
+
+Previewing the accuracy table shows the expected results:
+
+```{r, echo=TRUE}
+head(accuracy, n = 3)
+tail(accuracy, n = 3)
+```
+
+Note in the first block that prediction accuracy is very strong, but there appears to be some over-fitting (note how test accuracy is 0.02 to 0.03 points weaker than train accuracy).  Meanwhile, with the simplest trees (cp = 0.03), there is no over-fitting but the accuracy is poor due to an insufficient number of splits.
+
+Currently, the accuracy table has results from every fold.  We want to understand the complexity parameter performance by averaging across all 10 folds:
+
+```{r, echo=TRUE}
+group_cp <- group_by(accuracy, cp)
+summary_cp <- summarize(group_cp, train_acc = round(mean(train_acc),4), test_acc = round(mean(test_acc),4))
+print(summary_cp)
+```
+
+It is interesting to note the plateau in the test accuracy in rows 4-5.  Of these options, we select cp = 0.0001 because it is the simplest tree that returns the greatest accuracy.
+
+```{r, echo=TRUE}
+final_tree <- rpart(classe ~ ., data = data_predict, method = "class", cp = 0.0001)
+```
+
+## Importing/Processing the Test dataset, and Final Predictions
+
+```{r, echo=TRUE}
+test_data <- read.csv("pml-testing.csv")
+test_data_keep <- test_data[,-which(names(test_data) %in% delete_cols)]
+test_data_keep$pred <- predict(final_tree, newdata = test_data_keep, type = "class")
+Answers <- test_data_keep[,c(60:61)]
+Answers
+```
+
+Finally, I will import the answers implied from the "num windows" variable:
+
+```{r, echo=TRUE}
+test_data_keep <- left_join(test_data_keep, num_window_pred, by = c("num_window" = "row_names"))
+Answers <- test_data_keep[,c(60:62)]
+colnames(Answers) <- c("problem_id", "model_pred", "num_windows_pred")
+Answers
+```
+
+As it turns out, the 'num window' connection predicts identical outcomes.  Given the test set accuracy of ~94%, achieving 20/20 isn't totally unexpected.  The expected value of correct outcomes is (94% * 20 predictions) = ~18.8.
+
+Submitting the answers in the Coursera form confirms 20/20 correct.
